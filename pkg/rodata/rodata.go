@@ -3,15 +3,23 @@ package rodata
 import (
 	"bytes"
 	"debug/elf"
+	"debug/macho"
 	"debug/pe"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"unicode"
 )
+
+func resignDarwin(path string) {
+	if _, err := exec.LookPath("codesign"); err == nil {
+		_ = exec.Command("codesign", "-f", "-s", "-", path).Run()
+	}
+}
 
 type FieldInfo struct {
 	Name   string `json:"name"`
@@ -209,6 +217,54 @@ func StripTypelinks(inPath, outPath string) (int, error) {
 		if err := os.WriteFile(outPath, data, 0755); err != nil {
 			return 0, fmt.Errorf("writing output: %w", err)
 		}
+		return typelinkWiped, nil
+	}
+
+	// Mach-O (macOS)
+	if mf, err := macho.Open(inPath); err == nil {
+		defer mf.Close()
+		var tlAddr uint64
+		typelinkWiped := 0
+		for _, sec := range mf.Sections {
+			name := strings.TrimRight(sec.Name, "\x00")
+			if name == "__typelink" || name == ".typelink" {
+				if uint64(sec.Offset)+sec.Size <= uint64(len(data)) {
+					for i := uint64(sec.Offset); i < uint64(sec.Offset)+sec.Size; i++ {
+						data[i] = 0
+					}
+					typelinkWiped = int(sec.Size / 4)
+					tlAddr = sec.Addr
+					break
+				}
+			}
+		}
+
+		if tlAddr != 0 {
+			needle := make([]byte, 8)
+			binary.LittleEndian.PutUint64(needle, tlAddr)
+			for _, sec := range mf.Sections {
+				// Search in writable segments (__DATA, __DATA_CONST, etc.)
+				if (strings.HasPrefix(sec.Seg, "__DATA") || sec.Seg == "") && uint64(sec.Offset)+sec.Size <= uint64(len(data)) {
+					sdata := data[sec.Offset : uint64(sec.Offset)+sec.Size]
+					for idx := 0; idx+24 <= len(sdata); {
+						match := bytes.Index(sdata[idx:], needle)
+						if match == -1 {
+							break
+						}
+						cur := idx + match
+						for k := uint64(sec.Offset) + uint64(cur) + 8; k < uint64(sec.Offset)+uint64(cur)+24; k++ {
+							data[k] = 0
+						}
+						idx = cur + 8
+					}
+				}
+			}
+		}
+
+		if err := os.WriteFile(outPath, data, 0755); err != nil {
+			return 0, fmt.Errorf("writing output: %w", err)
+		}
+		resignDarwin(outPath)
 		return typelinkWiped, nil
 	}
 

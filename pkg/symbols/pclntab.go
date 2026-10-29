@@ -4,14 +4,22 @@ import (
 	"bytes"
 	"crypto/rand"
 	"debug/elf"
+	"debug/macho"
 	"debug/pe"
 	"encoding/binary"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 )
+
+func resignDarwin(path string) {
+	if _, err := exec.LookPath("codesign"); err == nil {
+		_ = exec.Command("codesign", "-f", "-s", "-", path).Run()
+	}
+}
 
 func randomChar() byte {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
@@ -148,6 +156,47 @@ func StripFile(inPath, outPath, mode string) (int, int, error) {
 		}
 	}
 
+	if mf, err := macho.Open(inPath); err == nil {
+		defer mf.Close()
+		for _, sec := range mf.Sections {
+			name := strings.TrimRight(sec.Name, "\x00")
+			if name == "__gopclntab" || name == ".gopclntab" {
+				if uint64(sec.Offset)+sec.Size <= uint64(len(data)) {
+					secData := data[sec.Offset : uint64(sec.Offset)+sec.Size]
+					funcWiped, fileWiped, err := StripPCLnTab(secData, mode)
+					if err != nil {
+						return 0, 0, err
+					}
+					if err := os.WriteFile(outPath, data, 0755); err != nil {
+						return 0, 0, fmt.Errorf("writing output: %w", err)
+					}
+					resignDarwin(outPath)
+					return funcWiped, fileWiped, nil
+				}
+			}
+		}
+
+		// Embedded in other section
+		for _, sec := range mf.Sections {
+			if uint64(sec.Offset)+sec.Size <= uint64(len(data)) {
+				sData := data[sec.Offset : uint64(sec.Offset)+sec.Size]
+				magics := [][]byte{{0xf1, 0xff, 0xff, 0xff}, {0xf0, 0xff, 0xff, 0xff}}
+				for _, m := range magics {
+					if idx := bytes.Index(sData, m); idx != -1 && idx+16 <= len(sData) {
+						funcWiped, fileWiped, err := StripPCLnTab(sData[idx:], mode)
+						if err == nil {
+							if err := os.WriteFile(outPath, data, 0755); err != nil {
+								return 0, 0, fmt.Errorf("writing output: %w", err)
+							}
+							resignDarwin(outPath)
+							return funcWiped, fileWiped, nil
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return 0, 0, fmt.Errorf("unsupported binary format or .gopclntab not found")
 }
 
@@ -172,6 +221,17 @@ func Dump(binPath string, filter string, limit int) error {
 			if strings.TrimRight(sec.Name, "\x00") == ".gopclntab" {
 				pclnData = data[sec.Offset : sec.Offset+sec.Size]
 				break
+			}
+		}
+	} else if mf, err := macho.Open(binPath); err == nil {
+		defer mf.Close()
+		for _, sec := range mf.Sections {
+			name := strings.TrimRight(sec.Name, "\x00")
+			if name == "__gopclntab" || name == ".gopclntab" {
+				if uint64(sec.Offset)+sec.Size <= uint64(len(data)) {
+					pclnData = data[sec.Offset : uint64(sec.Offset)+sec.Size]
+					break
+				}
 			}
 		}
 	}
